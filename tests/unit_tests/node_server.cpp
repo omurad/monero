@@ -35,6 +35,7 @@
 #include "cryptonote_core/i_core_events.h"
 #include "cryptonote_protocol/cryptonote_protocol_handler.h"
 #include "cryptonote_protocol/cryptonote_protocol_handler.inl"
+#include "net/parse.h"
 #include "unit_tests_utils.h"
 #include <condition_variable>
 #include <thread>
@@ -42,6 +43,18 @@
 #define MAKE_IPV4_ADDRESS(a,b,c,d) epee::net_utils::ipv4_network_address{MAKE_IP(a,b,c,d),0}
 #define MAKE_IPV4_ADDRESS_PORT(a,b,c,d,e) epee::net_utils::ipv4_network_address{MAKE_IP(a,b,c,d),e}
 #define MAKE_IPV4_SUBNET(a,b,c,d,e) epee::net_utils::ipv4_network_subnet{MAKE_IP(a,b,c,d),e}
+
+static epee::net_utils::network_address MAKE_IPV6_ADDRESS(const char *addr_str)
+{
+  boost::asio::ip::address_v6 v6 = boost::asio::ip::make_address_v6(addr_str);
+  return epee::net_utils::ipv6_network_address{v6, 0};
+}
+
+static epee::net_utils::ipv6_network_subnet MAKE_IPV6_SUBNET(const char *addr_str, uint8_t mask)
+{
+  boost::asio::ip::address_v6 v6 = boost::asio::ip::make_address_v6(addr_str);
+  return epee::net_utils::ipv6_network_subnet{v6, mask};
+}
 
 namespace cryptonote {
   class blockchain_storage;
@@ -108,28 +121,38 @@ typedef nodetool::node_server<cryptonote::t_cryptonote_protocol_handler<test_cor
 
 static bool is_blocked(Server &server, const epee::net_utils::network_address &address, time_t *t = NULL)
 {
-  std::map<std::string, time_t> hosts = server.get_blocked_hosts();
-  for (auto rec: hosts)
+  if (address.get_type_id() == epee::net_utils::address_type::ipv4)
   {
-    if (rec.first == address.host_str())
+    const epee::net_utils::ipv4_network_address ipv4_address = address.as<epee::net_utils::ipv4_network_address>();
+
+    const std::map<epee::net_utils::ipv4_network_subnet, time_t> subnets = server.get_blocked_subnets();
+    for (const auto &subnet : subnets)
     {
-      if (t)
-        *t = rec.second;
-      return true;
+      if (subnet.first.matches(ipv4_address))
+      {
+        if (t)
+          *t = subnet.second;
+        return true;
+      }
     }
-  }
-
-  if (address.get_type_id() != epee::net_utils::address_type::ipv4)
     return false;
-  
-  const epee::net_utils::ipv4_network_address ipv4_address = address.as<epee::net_utils::ipv4_network_address>();
+  }
+  if (address.get_type_id() == epee::net_utils::address_type::ipv6)
+  {
+    const epee::net_utils::ipv6_network_address ipv6_address = address.as<epee::net_utils::ipv6_network_address>();
 
-  // check if in a blocked ipv4 subnet
-  const std::map<epee::net_utils::ipv4_network_subnet, time_t> subnets = server.get_blocked_subnets();
-  for (const auto &subnet : subnets)
-    if (subnet.first.matches(ipv4_address))
-      return true;
-
+    const std::map<epee::net_utils::ipv6_network_subnet, time_t> subnets = server.get_blocked_subnets_v6();
+    for (const auto &subnet : subnets)
+    {
+      if (subnet.first.matches(ipv6_address))
+      {
+        if (t)
+          *t = subnet.second;
+        return true;
+      }
+    }
+    return false;
+  }
   return false;
 }
 
@@ -141,44 +164,44 @@ TEST(ban, add)
   cprotocol.set_p2p_endpoint(&server);
 
   // starts empty
-  ASSERT_TRUE(server.get_blocked_hosts().empty());
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
-  // add an IP
+  // add an IP (stored as /32 subnet)
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
   // add the same, should not change
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
   // remove an unblocked IP, should not change
   ASSERT_FALSE(server.unblock_host(MAKE_IPV4_ADDRESS(1,2,3,5)));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
   // remove the IP, ends up empty
   ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 0);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
   // remove the IP from an empty list, still empty
   ASSERT_FALSE(server.unblock_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 0);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
   // add two for known amounts of time, they're both blocked
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 1));
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,5), 3));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 2);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 2);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
   ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
@@ -188,13 +211,13 @@ TEST(ban, add)
 #if 0
   // after two seconds, the first IP is unblocked, but not the second yet
   sleep(2);
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 
   // after two more seconds, the second IP is also unblocked
   sleep(2);
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 0);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
 #endif
@@ -202,17 +225,17 @@ TEST(ban, add)
   // add an IP again, then re-ban for longer, then shorter
   time_t t;
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 2));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4), &t));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
   ASSERT_TRUE(t >= 1);
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 9));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4), &t));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
   ASSERT_TRUE(t >= 8);
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 5));
-  ASSERT_TRUE(server.get_blocked_hosts().size() == 1);
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4), &t));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,5)));
   ASSERT_TRUE(t >= 4);
@@ -226,7 +249,7 @@ TEST(ban, limit)
   cprotocol.set_p2p_endpoint(&server);
 
   // starts empty
-  ASSERT_TRUE(server.get_blocked_hosts().empty());
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), std::numeric_limits<time_t>::max() - 1));
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS(1,2,3,4)));
@@ -240,18 +263,6 @@ TEST(ban, subnet)
   test_core pr_core;
   cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
   Server server(cprotocol);
-  {
-    boost::program_options::options_description opts{};
-    Server::init_options(opts);
-    cryptonote::core::init_options(opts);
-
-    char** args = nullptr;
-    boost::program_options::variables_map vm;
-    boost::program_options::store(
-      boost::program_options::parse_command_line(0, args, opts), vm
-    );
-    server.init(vm);
-  }
   cprotocol.set_p2p_endpoint(&server);
 
   ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,24), 10));
@@ -270,12 +281,248 @@ TEST(ban, subnet)
   ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
   ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,255,3,255), &seconds));
   ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,0,3,255), &seconds));
-  ASSERT_FALSE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,2,3,8,24)));
-  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
-  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,8), 10));
-  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
-  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,255,0,0,8)));
+  // Carve out a /24 from the /8 — should succeed and produce complement subnets
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,2,3,8,24)));
+  // The /8 is split into 24-8=16 complement subnets
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 16);
+  // The carved-out /24 should no longer be blocked
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,3,0), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,3,255), &seconds));
+  // Other IPs in the original /8 should still be blocked
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,0,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,255,255,255), &seconds));
+  // Unblock the entire original /8 range to clean up all complements
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,0,0,0,8)));
   ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+}
+
+TEST(ban, subnet_arithmetic)
+{
+  time_t seconds;
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // 1. Unblock subset of blocked supernet — ban /12, unban /24 within it
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(172,16,0,0,12), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,1), &seconds));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(172,16,1,0,24)));
+  // Should have 24-12=12 complement subnets
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 12);
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,0), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,255), &seconds));
+  // Other IPs in the /12 should still be blocked
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,2,0), &seconds));
+  // Clean up
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(172,16,0,0,12)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 2. Unblock 0.0.0.0/0 clears everything
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(192,168,0,0,16), 10));
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 3);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(0,0,0,0,0)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 3. Block supernet consolidates — ban two /24s + a host, then ban /8 superset
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,1,0,24), 10));
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,2,0,24), 10));
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(10,0,3,1), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 3);
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  // The two /24s, the /32 host, and the /8 should be consolidated into the /8
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,1,1), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,3,1), &seconds));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 4. Unblock non-overlapping (no-op) — returns false, nothing changes
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_FALSE(server.unblock_subnet(MAKE_IPV4_SUBNET(192,168,0,0,16)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8)));
+
+  // 5. Carve out /32 (single host) from /8
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,1,32)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 24); // 32-8=24 complement subnets
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,2), &seconds));
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 6. Exact match still works — backwards compatibility
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 7. Unblock removes matching host (/32) bans
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(10,0,0,1), 10));
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(10,0,0,2), 10));
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(192,168,1,1), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 3);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24)));
+  // Only the two 10.0.0.x /32 subnets should be removed
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV4_ADDRESS(10,0,0,1)));
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV4_ADDRESS(10,0,0,2)));
+  ASSERT_TRUE(is_blocked(server, MAKE_IPV4_ADDRESS(192,168,1,1)));
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS(192,168,1,1)));
+
+  // 8. Multiple sequential carve-outs — ban /8, carve /16, then carve /24 from remainder
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  // Carve out /16
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,16)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 8); // 16-8=8 complement subnets
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,1,0,0), &seconds));
+  // Carve out a /24 from the remaining blocked area
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,1,0,0,24)));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,1,0,0), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,1,0,255), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,1,1,0), &seconds));
+  // Clean up
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 9. Subset ban with different expiry — ban /8 (10s), then ban /24 within it (100s)
+  // The /24 should get its own expiry; the remainder keeps the old expiry
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,1,0,24), 100));
+  // The /8 was split: 1 entry for /24 + complements (24-8=16 complements)
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 17);
+  // The /24 should be blocked with the new (longer) expiry
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,1,1), &seconds));
+  ASSERT_TRUE(seconds >= 99);
+  // Other IPs in the original /8 should still be blocked with old expiry
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(seconds >= 9);
+  ASSERT_TRUE(seconds < 50);
+  // Clean up
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+
+  // 10. Re-ban after carve-out consolidates — ban /8, unban /16, re-ban /8
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,16)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 8); // 16-8=8 complements
+  // Re-ban the entire /8 — should consolidate back to 1 entry
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  // Clean up
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(10,0,0,0,8)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 0);
+}
+
+TEST(ban, subnet_parsing_and_arithmetic)
+{
+  // Test that parsing standard CIDR notation works correctly
+  auto subnet12 = net::get_ipv4_subnet_address("172.16.0.0/12", false);
+  ASSERT_TRUE(subnet12.has_value());
+
+  // Verify subnet() normalizes correctly: 172.16.0.0/12 covers 172.16-31.x.x
+  ASSERT_EQ(subnet12->subnet(), MAKE_IP(172,16,0,0));
+  ASSERT_EQ(subnet12->mask(), 12);
+
+  // Test matches() with IPs in range
+  ASSERT_TRUE(subnet12->matches(MAKE_IPV4_ADDRESS(172,16,0,0)));
+  ASSERT_TRUE(subnet12->matches(MAKE_IPV4_ADDRESS(172,16,1,1)));
+  ASSERT_TRUE(subnet12->matches(MAKE_IPV4_ADDRESS(172,31,255,255)));
+
+  // Test matches() with IPs outside range
+  ASSERT_FALSE(subnet12->matches(MAKE_IPV4_ADDRESS(172,15,255,255)));
+  ASSERT_FALSE(subnet12->matches(MAKE_IPV4_ADDRESS(172,32,0,0)));
+
+  // Test contains()
+  auto subnet24 = net::get_ipv4_subnet_address("172.16.1.0/24", false);
+  ASSERT_TRUE(subnet24.has_value());
+  ASSERT_TRUE(subnet12->contains(*subnet24));
+  ASSERT_FALSE(subnet24->contains(*subnet12));
+
+  // Test edge cases
+  auto subnet0 = net::get_ipv4_subnet_address("0.0.0.0/0", false);
+  ASSERT_TRUE(subnet0.has_value());
+  ASSERT_EQ(subnet0->subnet(), 0u);
+  ASSERT_TRUE(subnet0->matches(MAKE_IPV4_ADDRESS(255,255,255,255)));
+
+  auto subnet32 = net::get_ipv4_subnet_address("192.168.1.1/32", false);
+  ASSERT_TRUE(subnet32.has_value());
+  ASSERT_TRUE(subnet32->matches(MAKE_IPV4_ADDRESS(192,168,1,1)));
+  ASSERT_FALSE(subnet32->matches(MAKE_IPV4_ADDRESS(192,168,1,2)));
+
+  // Test ban/unban with parsed subnets
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  ASSERT_TRUE(server.block_subnet(*subnet12, 10));
+  time_t seconds;
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,5,10), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,31,255,255), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,32,0,0), &seconds));
+
+  // Test carving: unban /24 from /12 should create 12 complements
+  ASSERT_TRUE(server.unblock_subnet(*subnet24));
+  ASSERT_EQ(server.get_blocked_subnets().size(), 12u);
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,1,1), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(172,16,2,0), &seconds));
+}
+
+TEST(ban, host_subnet32_dedup)
+{
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // 1. ban /32 subnet then ban host → still one /32 entry (same thing)
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,32), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(is_blocked(server, MAKE_IPV4_ADDRESS(1,2,3,4)));
+
+  // clean up
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+
+  // 2. ban host then ban /32 subnet → still one entry
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,32), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(is_blocked(server, MAKE_IPV4_ADDRESS(1,2,3,4)));
+
+  // clean up
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,2,3,4,32)));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+
+  // 3. unban host removes /32 subnet ban
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(1,2,3,4,32), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS(1,2,3,4)));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV4_ADDRESS(1,2,3,4)));
+
+  // 4. unban /32 subnet removes host ban
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(1,2,3,4), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(1,2,3,4,32)));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV4_ADDRESS(1,2,3,4)));
 }
 
 TEST(ban, ignores_port)
@@ -289,9 +536,173 @@ TEST(ban, ignores_port)
   ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS_PORT(1,2,3,4,5), std::numeric_limits<time_t>::max() - 1));
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS_PORT(1,2,3,4,5)));
   ASSERT_TRUE(is_blocked(server,MAKE_IPV4_ADDRESS_PORT(1,2,3,4,6)));
+  // unblock_host with different port should still work (port is ignored for bans)
   ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS_PORT(1,2,3,4,5)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS_PORT(1,2,3,4,5)));
   ASSERT_FALSE(is_blocked(server,MAKE_IPV4_ADDRESS_PORT(1,2,3,4,6)));
+}
+
+TEST(ban, ipv6_add)
+{
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // starts empty
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV6_ADDRESS("::1")));
+
+  // add an IPv6 host
+  ASSERT_TRUE(server.block_host(MAKE_IPV6_ADDRESS("::1")));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 1);
+  ASSERT_TRUE(is_blocked(server, MAKE_IPV6_ADDRESS("::1")));
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV6_ADDRESS("::2")));
+
+  // add the same, should not change count
+  ASSERT_TRUE(server.block_host(MAKE_IPV6_ADDRESS("::1")));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 1);
+
+  // remove it
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV6_ADDRESS("::1")));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV6_ADDRESS("::1")));
+
+  // IPv6 bans don't affect IPv4
+  ASSERT_TRUE(server.block_host(MAKE_IPV6_ADDRESS("::1")));
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV4_ADDRESS(0,0,0,1)));
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV6_ADDRESS("::1")));
+}
+
+TEST(ban, ipv6_subnet)
+{
+  time_t seconds;
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // Ban a /64 subnet
+  ASSERT_TRUE(server.block_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 64), 10));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 1);
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV6_ADDRESS("2001:db8::1"), &seconds));
+  ASSERT_TRUE(seconds >= 9);
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV6_ADDRESS("2001:db8::ffff"), &seconds));
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV6_ADDRESS("2001:db9::1"), &seconds));
+
+  // Unblock it
+  ASSERT_TRUE(server.unblock_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 64)));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
+}
+
+TEST(ban, ipv6_subnet_carving)
+{
+  time_t seconds;
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // Ban /48, carve out /64 within it
+  ASSERT_TRUE(server.block_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 48), 10));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 1);
+  ASSERT_TRUE(server.unblock_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 64)));
+  // 64 - 48 = 16 complement subnets
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 16);
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV6_ADDRESS("2001:db8::1"), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV6_ADDRESS("2001:db8:1::1"), &seconds));
+
+  // Clean up
+  ASSERT_TRUE(server.unblock_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 48)));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
+
+  // Consolidation: ban sub-subnets, then ban supernet
+  ASSERT_TRUE(server.block_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 64), 10));
+  ASSERT_TRUE(server.block_subnet_v6(MAKE_IPV6_SUBNET("2001:db8:1::", 64), 10));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 2);
+  ASSERT_TRUE(server.block_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 48), 10));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().size() == 1);
+
+  // Clean up
+  ASSERT_TRUE(server.unblock_subnet_v6(MAKE_IPV6_SUBNET("2001:db8::", 48)));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
+}
+
+TEST(ban, ipv6_subnet_parsing)
+{
+  // Test CIDR parsing
+  auto subnet = net::get_ipv6_subnet_address("2001:db8::/32");
+  ASSERT_TRUE(subnet.has_value());
+  ASSERT_EQ(subnet->mask(), 32);
+
+  // Test that it matches correctly
+  boost::asio::ip::address_v6 addr_in = boost::asio::ip::make_address_v6("2001:db8::1");
+  epee::net_utils::ipv6_network_address na_in(addr_in, 0);
+  ASSERT_TRUE(subnet->matches(na_in));
+
+  boost::asio::ip::address_v6 addr_out = boost::asio::ip::make_address_v6("2001:db9::1");
+  epee::net_utils::ipv6_network_address na_out(addr_out, 0);
+  ASSERT_FALSE(subnet->matches(na_out));
+
+  // Test contains
+  auto subnet64 = net::get_ipv6_subnet_address("2001:db8::/64");
+  ASSERT_TRUE(subnet64.has_value());
+  ASSERT_TRUE(subnet->contains(*subnet64));
+  ASSERT_FALSE(subnet64->contains(*subnet));
+
+  // Test /128
+  auto subnet128 = net::get_ipv6_subnet_address("::1/128");
+  ASSERT_TRUE(subnet128.has_value());
+  boost::asio::ip::address_v6 lo = boost::asio::ip::make_address_v6("::1");
+  epee::net_utils::ipv6_network_address na_lo(lo, 0);
+  ASSERT_TRUE(subnet128->matches(na_lo));
+  boost::asio::ip::address_v6 lo2 = boost::asio::ip::make_address_v6("::2");
+  epee::net_utils::ipv6_network_address na_lo2(lo2, 0);
+  ASSERT_FALSE(subnet128->matches(na_lo2));
+
+  // Test /0
+  auto subnet0 = net::get_ipv6_subnet_address("::/0");
+  ASSERT_TRUE(subnet0.has_value());
+  ASSERT_TRUE(subnet0->matches(na_in));
+  ASSERT_TRUE(subnet0->matches(na_out));
+
+  // Test bracket syntax
+  auto subnet_bracket = net::get_ipv6_subnet_address("[2001:db8::]/48");
+  ASSERT_TRUE(subnet_bracket.has_value());
+  ASSERT_EQ(subnet_bracket->mask(), 48);
+
+  // Test implicit /128
+  auto subnet_implicit = net::get_ipv6_subnet_address("::1", true);
+  ASSERT_TRUE(subnet_implicit.has_value());
+  ASSERT_EQ(subnet_implicit->mask(), 128);
+
+  // Without allow_implicit_128, bare address should fail
+  auto subnet_no_implicit = net::get_ipv6_subnet_address("::1", false);
+  ASSERT_FALSE(subnet_no_implicit.has_value());
+}
+
+TEST(ban, ipv6_cross_protocol)
+{
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // Ban an IPv4 host, IPv6 should not be affected
+  ASSERT_TRUE(server.block_host(MAKE_IPV4_ADDRESS(10,0,0,1)));
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV6_ADDRESS("::1")));
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
+
+  // Ban an IPv6 host, IPv4 should not be affected
+  ASSERT_TRUE(server.block_host(MAKE_IPV6_ADDRESS("2001:db8::1")));
+  ASSERT_FALSE(is_blocked(server, MAKE_IPV4_ADDRESS(1,2,3,4)));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1); // still just the IPv4
+
+  // Clean up
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV4_ADDRESS(10,0,0,1)));
+  ASSERT_TRUE(server.unblock_host(MAKE_IPV6_ADDRESS("2001:db8::1")));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+  ASSERT_TRUE(server.get_blocked_subnets_v6().empty());
 }
 
 TEST(ban, file_banlist)
@@ -364,6 +775,78 @@ TEST(ban, file_banlist)
 
   // random IP
   EXPECT_FALSE( is_blocked(server, MAKE_IPV4_ADDRESS_PORT(145,036,205,235,9999)) );
+}
+
+TEST(ban, add_only)
+{
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // Ban for 10 seconds
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24), 10));
+  time_t seconds;
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(seconds >= 9);
+
+  // add_only=true with a shorter time should NOT decrease the ban
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24), 1, true));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(seconds >= 9); // still the longer ban
+
+  // add_only=true with a longer time should increase the ban
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24), 100, true));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(seconds >= 99);
+
+  // add_only=false should overwrite regardless
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(10,0,0,0,24), 5, false));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(10,0,0,1), &seconds));
+  ASSERT_TRUE(seconds <= 5);
+}
+
+TEST(ban, ipv4_mask_zero)
+{
+  time_t seconds;
+  test_core pr_core;
+  cryptonote::t_cryptonote_protocol_handler<test_core> cprotocol(pr_core, NULL);
+  Server server(cprotocol);
+  cprotocol.set_p2p_endpoint(&server);
+
+  // mask=0 means ban everything
+  ASSERT_TRUE(server.block_subnet(MAKE_IPV4_SUBNET(0,0,0,0,0), 10));
+  ASSERT_TRUE(server.get_blocked_subnets().size() == 1);
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,3,4), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(255,255,255,255), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(0,0,0,0), &seconds));
+  ASSERT_TRUE(server.is_host_blocked(MAKE_IPV4_ADDRESS(192,168,1,1), &seconds));
+
+  // Unblock everything
+  ASSERT_TRUE(server.unblock_subnet(MAKE_IPV4_SUBNET(0,0,0,0,0)));
+  ASSERT_TRUE(server.get_blocked_subnets().empty());
+  ASSERT_FALSE(server.is_host_blocked(MAKE_IPV4_ADDRESS(1,2,3,4), &seconds));
+}
+
+TEST(ban, ipv6_subnet_serialization_roundtrip)
+{
+  // Create an IPv6 subnet and verify serialization round-trip via KV
+  epee::net_utils::ipv6_network_subnet original = MAKE_IPV6_SUBNET("2001:db8::", 48);
+
+  // Serialize
+  epee::serialization::portable_storage stg;
+  auto section = stg.open_section("test", nullptr, true);
+  ASSERT_TRUE(original.store(stg, section));
+
+  // Deserialize
+  epee::net_utils::ipv6_network_subnet deserialized;
+  ASSERT_TRUE(deserialized._load(stg, section));
+
+  // Verify equality
+  ASSERT_EQ(original, deserialized);
+  ASSERT_EQ(original.mask(), deserialized.mask());
+  ASSERT_EQ(original.subnet(), deserialized.subnet());
+  ASSERT_EQ(original.str(), deserialized.str());
 }
 
 TEST(node_server, bind_same_p2p_port)
@@ -564,7 +1047,6 @@ TEST(cryptonote_protocol_handler, race_condition)
     using connections_t = std::vector<std::pair<zone_t, uuid_t>>;
     struct bans {
       using subnets = std::map<epee::net_utils::ipv4_network_subnet, time_t>;
-      using hosts = std::map<std::string, time_t>;
     };
     shared_state_ptr shared_state;
     core_protocol_ptr core_protocol;
@@ -650,7 +1132,13 @@ TEST(cryptonote_protocol_handler, race_condition)
     virtual bans::subnets get_blocked_subnets() override {
       return {};
     }
-    virtual bans::hosts get_blocked_hosts() override {
+    virtual bool block_subnet_v6(const epee::net_utils::ipv6_network_subnet &, time_t, bool) override {
+      return {};
+    }
+    virtual bool unblock_subnet_v6(const epee::net_utils::ipv6_network_subnet &) override {
+      return {};
+    }
+    virtual std::map<epee::net_utils::ipv6_network_subnet, time_t> get_blocked_subnets_v6() override {
       return {};
     }
     virtual uint64_t get_public_connections_count() override {

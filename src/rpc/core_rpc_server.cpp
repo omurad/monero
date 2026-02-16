@@ -2832,22 +2832,19 @@ namespace cryptonote
     RPC_TRACKER(get_bans);
 
     auto now = time(nullptr);
-    std::map<std::string, time_t> blocked_hosts = m_p2p.get_blocked_hosts();
-    for (std::map<std::string, time_t>::const_iterator i = blocked_hosts.begin(); i != blocked_hosts.end(); ++i)
+    std::map<epee::net_utils::ipv4_network_subnet, time_t> blocked_subnets = m_p2p.get_blocked_subnets();
+    for (std::map<epee::net_utils::ipv4_network_subnet, time_t>::const_iterator i = blocked_subnets.begin(); i != blocked_subnets.end(); ++i)
     {
       if (i->second > now) {
         COMMAND_RPC_GETBANS::ban b;
-        b.host = i->first;
-        b.ip = 0;
-        uint32_t ip;
-        if (epee::string_tools::get_ip_int32_from_string(ip, b.host))
-          b.ip = ip;
+        b.host = i->first.host_str();
+        b.ip = (i->first.mask() == 32) ? i->first.subnet() : 0;
         b.seconds = i->second - now;
         res.bans.push_back(b);
       }
     }
-    std::map<epee::net_utils::ipv4_network_subnet, time_t> blocked_subnets = m_p2p.get_blocked_subnets();
-    for (std::map<epee::net_utils::ipv4_network_subnet, time_t>::const_iterator i = blocked_subnets.begin(); i != blocked_subnets.end(); ++i)
+    std::map<epee::net_utils::ipv6_network_subnet, time_t> blocked_subnets_v6 = m_p2p.get_blocked_subnets_v6();
+    for (auto i = blocked_subnets_v6.begin(); i != blocked_subnets_v6.end(); ++i)
     {
       if (i->second > now) {
         COMMAND_RPC_GETBANS::ban b;
@@ -2909,6 +2906,15 @@ namespace cryptonote
             m_p2p.block_subnet(*ns_parsed, i->seconds);
           else
             m_p2p.unblock_subnet(*ns_parsed);
+          continue;
+        }
+        auto ns_v6_parsed = net::get_ipv6_subnet_address(i->host);
+        if (ns_v6_parsed)
+        {
+          if (i->ban)
+            m_p2p.block_subnet_v6(*ns_v6_parsed, i->seconds);
+          else
+            m_p2p.unblock_subnet_v6(*ns_v6_parsed);
           continue;
         }
       }

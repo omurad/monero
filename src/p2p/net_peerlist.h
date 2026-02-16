@@ -121,6 +121,7 @@ namespace nodetool
     bool remove_from_peer_anchor(const epee::net_utils::network_address& addr);
     bool remove_from_peer_white(const peerlist_entry& pe);
     template<typename F> size_t filter(bool white, const F &f); // f returns true: drop, false: keep
+    template<typename F> size_t filter_anchor(const F &f); // f returns true: drop, false: keep
     
   private:
     struct by_time{};
@@ -546,6 +547,27 @@ namespace nodetool
         ++i;
     }
     CATCH_ENTRY_L0("peerlist_manager::filter()", filtered);
+    return filtered;
+  }
+  //--------------------------------------------------------------------------------------------------
+  template<typename F> size_t peerlist_manager::filter_anchor(const F &f)
+  {
+    size_t filtered = 0;
+    TRY_ENTRY();
+    CRITICAL_REGION_LOCAL(m_peerlist_lock);
+    anchor_peers_indexed::index<by_addr>::type& sorted_index = m_peers_anchor.get<by_addr>();
+    auto i = sorted_index.begin();
+    while (i != sorted_index.end())
+    {
+      if (f(*i))
+      {
+        i = sorted_index.erase(i);
+        ++filtered;
+      }
+      else
+        ++i;
+    }
+    CATCH_ENTRY_L0("peerlist_manager::filter_anchor()", filtered);
     return filtered;
   }
   //--------------------------------------------------------------------------------------------------

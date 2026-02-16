@@ -32,8 +32,10 @@
 #include <boost/uuid/uuid.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address_v6.hpp>
+#include <cassert>
 #include <typeinfo>
 #include <type_traits>
+#include <vector>
 #include "byte_slice.h"
 #include "enums.h"
 #include "misc_log_ex.h"
@@ -132,19 +134,38 @@ namespace net_utils
 		{}
 
 		constexpr ipv4_network_subnet(uint32_t ip, uint8_t mask) noexcept
-			: m_ip(ip), m_mask(mask) {}
+			: m_ip(ip & cidr_to_le_mask(mask)), m_mask(mask) { assert(mask <= 32); }
 
 		bool equal(const ipv4_network_subnet& other) const noexcept;
 		bool less(const ipv4_network_subnet& other) const noexcept;
 		constexpr bool is_same_host(const ipv4_network_subnet& other) const noexcept
 		{ return subnet() == other.subnet(); }
-                bool matches(const ipv4_network_address &address) const;
+		bool matches(const ipv4_network_address &address) const;
+		bool contains(const ipv4_network_subnet& other) const noexcept;
 
-		constexpr uint32_t subnet() const noexcept { return m_ip & ~(0xffffffffull << m_mask); }
+		constexpr uint8_t mask() const noexcept { return m_mask; }
+		// Byte-swap for converting between LE (host) and BE (network) order.
+		// IPs are stored in LE via inet_addr/MAKE_IP, but CIDR masks are
+		// defined over big-endian bit positions, so we must swap before
+		// applying a bit-shift mask and swap back.
+		static constexpr uint32_t swap32(uint32_t v) noexcept
+		{
+			return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8)
+			     | ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
+		}
+		static constexpr uint32_t cidr_to_le_mask(uint8_t prefix) noexcept
+		{
+			return prefix == 0 ? 0u : swap32(0xFFFFFFFFu << (32 - prefix));
+		}
+		constexpr uint32_t subnet() const noexcept
+		{
+			return m_ip & cidr_to_le_mask(m_mask);
+		}
 		std::string str() const;
 		std::string host_str() const;
 		bool is_loopback() const;
 		bool is_local() const;
+		std::vector<ipv4_network_subnet> complement(const ipv4_network_subnet &child) const;
 		static constexpr address_type get_type_id() noexcept { return address_type::invalid; }
 		static constexpr zone get_zone() noexcept { return zone::public_; }
 		static constexpr bool is_blockable() noexcept { return true; }
@@ -219,6 +240,60 @@ namespace net_utils
 	inline bool operator>(const ipv6_network_address& lhs, const ipv6_network_address& rhs) noexcept
 	{ return rhs.less(lhs); }
 	inline bool operator>=(const ipv6_network_address& lhs, const ipv6_network_address& rhs) noexcept
+	{ return !lhs.less(rhs); }
+
+	class ipv6_network_subnet
+	{
+		boost::asio::ip::address_v6::bytes_type m_ip;
+		uint8_t m_mask;
+
+	public:
+		ipv6_network_subnet() noexcept
+			: m_ip{{}}, m_mask(0)
+		{}
+
+		ipv6_network_subnet(const boost::asio::ip::address_v6::bytes_type &ip, uint8_t mask);
+		ipv6_network_subnet(const boost::asio::ip::address_v6 &ip, uint8_t mask);
+
+		bool equal(const ipv6_network_subnet& other) const noexcept;
+		bool less(const ipv6_network_subnet& other) const noexcept;
+		bool matches(const ipv6_network_address &address) const;
+		bool contains(const ipv6_network_subnet& other) const noexcept;
+
+		uint8_t mask() const noexcept { return m_mask; }
+		boost::asio::ip::address_v6::bytes_type subnet() const;
+		std::string str() const;
+		std::string host_str() const;
+		bool is_loopback() const;
+		bool is_local() const;
+		std::vector<ipv6_network_subnet> complement(const ipv6_network_subnet &child) const;
+
+	private:
+		static void apply_cidr_mask(boost::asio::ip::address_v6::bytes_type &bytes, uint8_t prefix);
+		static void set_bit(boost::asio::ip::address_v6::bytes_type &bytes, uint8_t bit_pos);
+
+	public:
+
+		BEGIN_KV_SERIALIZE_MAP()
+			boost::asio::ip::address_v6::bytes_type bytes = this_ref.m_ip;
+			epee::serialization::selector<is_store>::serialize_t_val_as_blob(bytes, stg, hparent_section, "m_ip");
+			if (!is_store)
+				const_cast<ipv6_network_subnet&>(this_ref).m_ip = bytes;
+			KV_SERIALIZE(m_mask)
+		END_KV_SERIALIZE_MAP()
+	};
+
+	inline bool operator==(const ipv6_network_subnet& lhs, const ipv6_network_subnet& rhs) noexcept
+	{ return lhs.equal(rhs); }
+	inline bool operator!=(const ipv6_network_subnet& lhs, const ipv6_network_subnet& rhs) noexcept
+	{ return !lhs.equal(rhs); }
+	inline bool operator<(const ipv6_network_subnet& lhs, const ipv6_network_subnet& rhs) noexcept
+	{ return lhs.less(rhs); }
+	inline bool operator<=(const ipv6_network_subnet& lhs, const ipv6_network_subnet& rhs) noexcept
+	{ return !rhs.less(lhs); }
+	inline bool operator>(const ipv6_network_subnet& lhs, const ipv6_network_subnet& rhs) noexcept
+	{ return rhs.less(lhs); }
+	inline bool operator>=(const ipv6_network_subnet& lhs, const ipv6_network_subnet& rhs) noexcept
 	{ return !lhs.less(rhs); }
 
 	class network_address
